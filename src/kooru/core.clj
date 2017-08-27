@@ -1,6 +1,6 @@
 (ns kooru.core
   (:require [clojure.core.async
-             :refer [close! tap >!! mult go-loop thread timeout alts!! chan]
+             :refer [close! tap >!! <! mult go-loop thread timeout alts!! chan]
              :as a]
             [clojure.set :refer [map-invert]]
             [clojure.tools.logging :as log])
@@ -79,7 +79,7 @@
                 :else
                 (let [[state' output msg']
                       (f state (get inputs' p) v)
-                      out-chan (get outputs' output)]
+                      out-chan (get outputs output)]
                   (when (and output msg')
                     (>!! out-chan msg'))
 
@@ -100,31 +100,50 @@
 
 (comment
 
-  (defn p
+
+  (defn printer
+    [c m]
+    (go-loop []
+      (when-let [msg (<! c)]
+        (prn m msg)
+        (recur))))
+
+
+
+  (defn sorting-hat
     [s i m]
-    (when (= m :ex)
-      (throw (Exception. "Hi")))
-    (prn i "> " m)
-    [s nil nil])
+    (let [house  (-> (Math/abs (.hashCode m))
+                     (mod 4)
+                     ((partial nth
+                         [:gryffindor :hufflepuff :ravenclaw :slytherin])))]
+      [s house m]))
 
 
   (def _ctrl (ctrl))
 
   (def inputs {:one (chan) :two (chan)})
 
-  (def outputs {:one (chan)})
+  (def outputs
+    {:gryffindor (chan) :hufflepuff (chan) :ravenclaw (chan) :slytherin (chan)})
 
-  (component* "printer" inputs p outputs _ctrl)
+  (doseq [[h c] outputs]
+    (printer c (str h ">")))
 
-  (>!! (:one inputs) "Hello")
+  (component* "sorting-hat" inputs sorting-hat outputs _ctrl)
 
-  (>!! (:two inputs) :ex)
+
+  (doall (map close! (vals outputs)))
+
+  (>!! (:one inputs) "Peter Parker")
+
+  (>!! (:two inputs) "Harry Potter")
 
   (close! (:two inputs))
 
   (close! (:one inputs))
 
   (abort _ctrl)
+
 
   ;;END REPL
   )
