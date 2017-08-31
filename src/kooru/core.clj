@@ -37,7 +37,7 @@
 ;;                                                                            ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (defn component*
-  "Abstract many-to-one component.
+  "Abstract many-to-many component.
   `id`      - an identifier for this component (used in logs etc).
   `inputs`  - map containining input channels keyed by name
   `f`       - function of arity 3 [state input msg].
@@ -112,6 +112,40 @@
   "many-to-one component - reads messages from many channels, calls function f
   with the message, and routes the output messate to a single output channel.
 
+  `id`        - an identifier for this component (used in logs etc).
+  `inputs`    - map containining input channels keyed by name
+  `f`         -   function of arity 3 [state input msg].
+                `state`  - persistent state of this component. Set to nil for the
+                         first time.
+                `input`  - name of the channel from which the message was read.
+                `msg`    - message read from the input channels.
+                f must return a tuple [state' msg']
+                `state'` - updated state.
+                `msg'    - output message
+  `output-id` - an optional name for the output channel. defaulted to :default
+  `output`    - output channel.
+  `ctrl`      - ctrl provides mechanism necessary to abort incase of an
+                exception and also listen to abort signal from other components
+                in the pipeline this component is a part of."
+  ([id inputs f output ctrl]
+   (many-to-one id inputs f :default output ctrl))
+  ([id inputs f output-id output ctrl]
+   (component*
+    id
+    inputs
+    (fn [state input msg]
+      (let [[state' msg'] (f state input msg)]
+        [state' output-id msg']))
+    {output-id output}
+    ctrl)))
+
+
+
+(defn many-to-many-broadcast
+  "many-to-many component - reads messages from many input channels,
+  calls function f with the message, and broadcasts the output message
+  to all the output channels supplied.
+
   `id`      - an identifier for this component (used in logs etc).
   `inputs`  - map containining input channels keyed by name
   `f`       - function of arity 3 [state input msg].
@@ -122,57 +156,66 @@
               f must return a tuple [state' msg']
               `state'` - updated state.
               `msg'    - output message
-  `output`  - output channel.
+  `outputs` - map of output channels keyed by name.
   `ctrl`    - ctrl provides mechanism necessary to abort incase of an
               exception and also listen to abort signal from other components
-              in the pipeline this component is a part of.
-   `f` must be a sing'"
-  [id inputs f output ctrl]
-  (component*
-   id
-   inputs
-   (fn [state input msg]
-     (let [[state' msg'] (f state input msg)]
-       [state' :default msg']))
-   {:default output}
-   ctrl)
+              in the pipeline this component is a part of."
+  [id inputs f outputs ctrl]
+  ;; the broadcast is setup using an internal output channel which
+  ;; will be passed to the abstract component.
+  (let [internal-output (chan)
+        broadcast       (mult internal-output)]
+    (doall (map (partial tap broadcast) outputs))
+    (component*
+     id
+     inputs
+     (fn [state input msg]
+       (let [[state' msg'] (f state input msg)]
+         [state' :broadcast msg']))
+     {:broadcast internal-output}
+     ctrl)))
 
-  {:id id :inputs inputs :output output})
+
+
+(def many-to-many component*)
 
 
 
 (defn one-to-one
   "one-to-one component - reads messages from a single  input channel, calls
-  function f with the message, and routes the output messate to a single output
+  function f with the message, and routes the output message to a single output
   channel.
 
-  `id`      - an identifier for this component (used in logs etc).
-  `input`   - input channel
-  `f`       - function of arity 2 [state msg].
-              `state`  - persistent state of this component. Set to nil for the
-                         first time.
-              `msg`    - message read from the input channels.
-              f must return a tuple [state' msg']
-              `state'` - updated state.
-              `msg'    - output message
-  `output`  - output channel.
-  `ctrl`    - ctrl provides mechanism necessary to abort incase of an
-              exception and also listen to abort signal from other components
-              in the pipeline this component is a part of.
-   `f` must be a sing'"
-  [id input f output ctrl]
-  (component*
-   id
-   {:default input}
-   (fn [state input msg]
-     (let [[state' msg'] (f state :default msg)]
-       [state' :default msg']))
-   {:default output}
-   ctrl)
+  `id`        - an identifier for this component (used in logs etc).
+  `input-id`  - optional name for the input channel. defaulted to :default
+  `input`     - input channel
+  `f`         - function of arity 2 [state msg].
+                `state`  - persistent state of this component. Set to nil for the
+                           first time.
+                `msg`    - message read from the input channels.
+                f must return a tuple [state' msg']
+                `state'` - updated state.
+                `msg'    - output message
+  `output-id`- optional name for the output channel. defaulted to :default
+  `output`   - output channel.
+  `ctrl`     - ctrl provides mechanism necessary to abort incase of an
+               exception and also listen to abort signal from other components
+               in the pipeline this component is a part of."
+  ([id input f output ctrl]
+   (one-to-one id :default input f :default output ctrl))
+  ([id input-id input f output-id output ctrl]
+   (component*
+    id
+    {input-id input}
+    (fn [state input msg]
+      (let [[state' msg'] (f state input-id msg)]
+        [state' output-id msg']))
+    {output-id output}
+    ctrl)))
 
-  {:id id :input input :output output})
 
-
+;;TODO: one-to-many
+;;TODO: one-to-many-broadcast
 
 
 (defn -main
@@ -208,7 +251,7 @@
        [s house m])))
 
 
-  ;;;;;;;;; abstract component
+;;;;;;;;; abstract component
   (def _ctrl (ctrl))
 
   (def inputs {:one (chan) :two (chan)})
@@ -233,21 +276,117 @@
 
   (abort _ctrl)
 
-  ;;;;;;;;;; many-to-one
+;;;;;;;;;; many-to-one
+  (def _ctrl (ctrl))
+
+  (def inputs {:one (chan) :two (chan)})
+
   (def output (chan))
 
-  (many-to-one
-   "sorting-hat"
-   inputs
-   (fn [state m]
-     [state
-      (-> (Math/abs (.hashCode m))
-          (mod 4)
-          ((partial nth [:gryffindor :hufflepuff :ravenclaw :slytherin])))])
-   output
-   _ctrl)
+  (def m
+    (many-to-one
+     "sorting-hat"
+     inputs
+     (fn [state input msg]
+       [state
+        (-> (Math/abs (.hashCode m))
+            (mod 4)
+            ((partial nth [:gryffindor :hufflepuff :ravenclaw :slytherin])))])
+     :house
+     output
+     _ctrl))
+
+  m
 
   (printer output "SORTING HAT:")
+
+  (>!! (:one inputs) "Peter Parker")
+
+  (>!! (:two inputs) "Harry Potter")
+
+  (close! (:two inputs))
+
+  (close! (:one inputs))
+
+  (abort _ctrl)
+
+ ;;;;;;;;;; one-to-one
+  (def _ctrl (ctrl))
+
+  (def input (chan))
+
+  (def output (chan))
+
+  (def o
+    (one-to-one
+     "sorting-hat"
+     :one input
+     (fn [state msg]
+       (let [{:keys [count]} state
+             cnt (inc count)]
+         [(assoc state :count cnt)
+          (-> (Math/abs (.hashCode m))
+              (mod 4)
+              ((partial nth [:gryffindor :hufflepuff :ravenclaw :slytherin]))
+              (str " , called " cnt " times"))]))
+     :house output
+     _ctrl))
+
+  m
+
+  (printer output "SORTING HAT:")
+
+  (>!! (:one inputs) "Peter Parker")
+
+  (>!! (:two inputs) "Harry Potter")
+
+  (close! (:two inputs))
+
+  (close! (:one inputs))
+
+  (abort _ctrl)
+
+
+  ;;;;;;;broadcast
+  (def _ctrl (ctrl))
+
+  (def inputs {:one (chan) :two (chan)})
+
+  (def outputs [(chan) (chan) (chan) (chan)])
+
+  (def b
+    (many-to-many-broadcast
+     "sorting-hat"
+     inputs
+     (fn [state input msg]
+       (prn "Got " msg)
+       (let [{:keys [count]} state
+             cnt (if count (inc count) 1)]
+         [(assoc state :count cnt)
+          (-> (Math/abs (.hashCode m))
+              (mod 4)
+              ((partial nth [:gryffindor :hufflepuff :ravenclaw :slytherin]))
+              (str " , called " cnt " times"))]))
+     outputs
+     _ctrl))
+
+
+  m
+
+  (map #(printer % "SH") outputs)
+
+  (>!! (:one inputs) "Peter Parker")
+
+  (>!! (:two inputs) "Harry Potter")
+
+  (close! (:two inputs))
+
+  (close! (:one inputs))
+
+  (abort _ctrl)
+
+
+
 
 
 
